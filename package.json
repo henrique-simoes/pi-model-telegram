@@ -1,0 +1,30 @@
+{
+  "name": "pi-model-telegram",
+  "version": "0.1.0",
+  "description": "Manage pi providers, models, and thinking levels from a Telegram chat connected through pi-chat.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-chat",
+    "telegram"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/henrique-simoes/pi-model-telegram.git"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types test/parse.test.ts",
+    "typecheck": "tsc --noEmit --skipLibCheck --target es2022 --module esnext --moduleResolution bundler --strict false --types node extensions/pi-model-telegram.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.6.3"
+  }
+}
