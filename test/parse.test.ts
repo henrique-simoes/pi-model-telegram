@@ -111,3 +111,24 @@ const huge = "x".repeat(5000);
 assert.deepEqual(chunk(huge, 3900), [huge]);
 
 console.log("chunking tests passed");
+
+import { isPendingReply } from "../extensions/pi-model-telegram.ts";
+
+// A numbered picker accepts only a number or cancel; ordinary chat must pass
+// through to the model instead of being answered "reply with a number".
+const picker = { kind: "login" };
+assert.equal(isPendingReply(picker, "2"), true);
+assert.equal(isPendingReply(picker, " 15 "), true);
+assert.equal(isPendingReply(picker, "cancel"), true);
+assert.equal(isPendingReply(picker, "Cancel"), true);
+assert.equal(isPendingReply(picker, "Hi!"), false);      // the reported failure
+assert.equal(isPendingReply(picker, "Hi?"), false);
+assert.equal(isPendingReply(picker, "what is 2 + 2"), false);
+assert.equal(isPendingReply(picker, "2 please"), false);
+
+// Free-text steps legitimately take anything, including something chatty.
+assert.equal(isPendingReply({ kind: "apikey" }, "sk-ant-whatever"), true);
+assert.equal(isPendingReply({ kind: "apikey" }, "Hi!"), true);
+assert.equal(isPendingReply({ kind: "endpoint" }, "https://api.example.com/v1"), true);
+
+console.log("pending-gate tests passed");

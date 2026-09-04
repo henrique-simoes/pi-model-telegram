@@ -122,6 +122,22 @@ interface EndpointDraft {
 }
 
 let pending: Pending | undefined;
+let pendingAt = 0;
+
+/** Abandon a half-finished picker rather than trapping the chat in it. */
+const PENDING_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Is this message an answer to the open prompt? A free-text step (an API key,
+ * an endpoint field) takes anything; a numbered picker takes only a number or
+ * "cancel". Anything else is ordinary chat and must be left alone.
+ */
+export function isPendingReply(pending: { kind: string }, text: string): boolean {
+	const trimmed = text.trim();
+	if (trimmed.toLowerCase() === "cancel") return true;
+	if (pending.kind === "apikey" || pending.kind === "endpoint") return true;
+	return /^\d+$/.test(trimmed);
+}
 /** Set when a command was handled, so the resulting turn is aborted. */
 let suppressTurn = false;
 
@@ -303,6 +319,14 @@ export function pickCommand(prompt: string, commands: Set<string>): string | und
 // ------------------------------------------------------------------- helpers
 
 function providerState(ctx: any, provider: string): string {
+	// A subscription/OAuth provider such as openai-codex has no apiKey, so the
+	// registry check alone reports it as unauthenticated even while it is the
+	// active model. Presence in auth.json is the authoritative signal.
+	try {
+		if (Object.prototype.hasOwnProperty.call(readJson(AUTH_FILE), provider)) return "authenticated";
+	} catch {
+		// fall through to the registry
+	}
 	try {
 		const auth = ctx?.modelRegistry?.getProviderAuth?.(provider);
 		return auth?.apiKey || auth?.headers || auth?.baseUrl ? "authenticated" : "not authenticated";
@@ -351,7 +375,12 @@ export default function (pi: any) {
 	// A handled input would strand pi-chat's chatTurnInFlight flag, so the turn
 	// is allowed to start and cancelled here instead. pi-chat reads stopReason
 	// "aborted", clears the flag, and delivers nothing to the chat.
-	pi.on("agent_start", async (_event: any, ctx: any) => {
+	// Abort on turn_start, not agent_start. Aborting before the agent loop is
+	// running ends the turn with stopReason "error", and pi-chat reports that to
+	// the chat as "pi-chat error: This operation was aborted". Its "aborted"
+	// branch is silent, so the cancel has to land once the turn is genuinely in
+	// flight.
+	pi.on("turn_start", async (_event: any, ctx: any) => {
 		if (!suppressTurn) return;
 		suppressTurn = false;
 		try {
@@ -412,6 +441,17 @@ export default function (pi: any) {
 		};
 
 		try {
+			if (pending && Date.now() - pendingAt > PENDING_TTL_MS) {
+				pending = undefined;
+			}
+
+			if (pending && !isPendingReply(pending, chosen)) {
+				// Ordinary conversation while a picker is open must reach the
+				// model rather than being answered with "reply with a number".
+				pending = undefined;
+				return;
+			}
+
 			if (pending) {
 				if (command === "cancel") {
 					pending = undefined;
@@ -450,6 +490,7 @@ export default function (pi: any) {
 							return;
 						}
 						pending = { kind: "endpoint", step: "baseUrl", draft: { ...draft, name } };
+						pendingAt = Date.now();
 						await reply(
 							`Name: ${name}\n\nSend the base URL, for example https://api.example.com/v1`,
 						);
@@ -461,11 +502,13 @@ export default function (pi: any) {
 							return;
 						}
 						pending = { kind: "endpoint", step: "modelId", draft: { ...draft, baseUrl: chosen } };
+						pendingAt = Date.now();
 						await reply("Send the model id exposed by that endpoint, for example gpt-4o.");
 						return;
 					}
 					if (step === "modelId") {
 						pending = { kind: "endpoint", step: "apiKey", draft: { ...draft, modelId: chosen } };
+						pendingAt = Date.now();
 						await reply(
 							[
 								"Send the API key for this endpoint.",
@@ -551,6 +594,7 @@ export default function (pi: any) {
 						return;
 					}
 					pending = { kind: "apikey", provider };
+					pendingAt = Date.now();
 					await reply(
 						[
 							`Send the API key for ${provider} as your next message.`,
@@ -611,6 +655,7 @@ export default function (pi: any) {
 						return;
 					}
 					pending = { kind: "model", items: models };
+					pendingAt = Date.now();
 					const active = ctx?.model ? `\n\nActive: ${ctx.model.provider}/${ctx.model.id}` : "";
 					await reply(
 						`Select a model:\n${numbered(models.map((e) => `${e.provider}/${e.id}`))}${active}`,
@@ -620,6 +665,7 @@ export default function (pi: any) {
 
 				case "thinking": {
 					pending = { kind: "thinking" };
+					pendingAt = Date.now();
 					await reply(
 						`Select a thinking level:\n${numbered([...THINKING_LEVELS])}\n\nActive: ${ctx?.thinkingLevel ?? "unknown"}`,
 					);
@@ -641,6 +687,7 @@ export default function (pi: any) {
 						return;
 					}
 					pending = { kind: "login", providers: providers.map((e) => e.key) };
+					pendingAt = Date.now();
 					await reply(
 						[
 							"Select a provider to authenticate with an API key:",
@@ -655,6 +702,7 @@ export default function (pi: any) {
 
 				case "endpoint": {
 					pending = { kind: "endpoint", step: "name", draft: {} };
+					pendingAt = Date.now();
 					await reply(
 						[
 							"Add a custom OpenAI-compatible endpoint.",
