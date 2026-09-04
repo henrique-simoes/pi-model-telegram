@@ -1,6 +1,6 @@
 {
   "name": "pi-model-telegram",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Manage pi providers, models, and thinking levels from a Telegram chat connected through pi-chat.",
   "type": "module",
   "keywords": [

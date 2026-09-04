@@ -380,8 +380,28 @@ export default function (pi: any) {
 		if (!pending && !COMMANDS.has(command)) return;
 
 		const reply = async (text: string) => {
-			suppressTurn = true;
 			await send(target, text);
+			if (ctx?.model) {
+				// A model exists, so a turn will start: cancel it in agent_start.
+				// pi-chat then sees stopReason "aborted" and clears its flag.
+				suppressTurn = true;
+				return;
+			}
+			// With no model configured pi never starts an agent turn, so
+			// agent_end never fires and pi-chat's chatTurnInFlight stays true -
+			// every later message is then dropped by tryDispatch. Verified on a
+			// live worker: queueLength 2, hasActiveJob true, chatTurnInFlight
+			// true, model "unknown/unknown".
+			//
+			// /chat-new is the only reset an extension can reach: it runs
+			// ctx.newSession(), whose session_shutdown tears the runtime down and
+			// clears the flag, then reconnects the same conversation. pi-chat
+			// uses it for its own "new" control command.
+			try {
+				pi.sendUserMessage("/chat-new", { deliverAs: "followUp" });
+			} catch {
+				// leave the flag alone rather than crash the handler
+			}
 		};
 
 		try {
