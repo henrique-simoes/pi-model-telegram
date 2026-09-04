@@ -34,6 +34,11 @@ const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "ma
 /** Commands pi-chat consumes itself; never shadow them. */
 const RESERVED = new Set(["stop", "new", "compact", "status"]);
 
+/** Commands this extension owns. */
+const COMMANDS = new Set([
+	"help", "model", "thinking", "login", "logout", "providers", "whichmodel", "cancel",
+]);
+
 const PAGE = 20;
 
 /**
@@ -266,15 +271,32 @@ function writeAuth(auth: Record<string, any>): void {
 /**
  * pi-chat formats each inbound message as
  *   `- [<timestamp>] [uid:<userId>] <userName>: <text>`
- * and batches several of them into one prompt. The command is the last such
- * line; earlier lines are older messages already shown to the user.
+ * and batches every message received since the last completed job into ONE
+ * prompt. Reading only the final line silently drops a command that arrived
+ * with others, so return the whole batch, oldest first.
  */
-export function lastUserText(prompt: string): string | undefined {
+export function transcriptTexts(prompt: string): string[] {
 	const pattern = /^- \[[^\]]*\] \[uid:[^\]]*\] [^:]*: ([\s\S]*)$/;
-	const lines = prompt.split("\n");
-	for (let i = lines.length - 1; i >= 0; i--) {
-		const match = pattern.exec(lines[i] as string);
-		if (match) return (match[1] ?? "").trim();
+	const found: string[] = [];
+	for (const line of prompt.split("\n")) {
+		const match = pattern.exec(line);
+		if (match) found.push((match[1] ?? "").trim());
+	}
+	return found;
+}
+
+export function lastUserText(prompt: string): string | undefined {
+	const all = transcriptTexts(prompt);
+	return all.length ? all[all.length - 1] : undefined;
+}
+
+/** Newest recognised command in a batch, so a burst of messages still works. */
+export function pickCommand(prompt: string, commands: Set<string>): string | undefined {
+	const all = transcriptTexts(prompt);
+	for (let i = all.length - 1; i >= 0; i--) {
+		const text = all[i] as string;
+		const word = (text.split(/\s+/)[0] ?? "").replace(/^\//, "").toLowerCase();
+		if (commands.has(word)) return text;
 	}
 	return undefined;
 }
@@ -291,12 +313,20 @@ function providerState(ctx: any, provider: string): string {
 }
 
 function listModels(ctx: any): Array<{ provider: string; id: string }> {
-	const scoped = Array.isArray(ctx.scopedModels) ? ctx.scopedModels : [];
-	const source =
-		scoped.length > 0 ? scoped.map((entry: any) => entry.model) : (ctx.modelRegistry?.getAvailable?.() ?? []);
-	return source
-		.filter(Boolean)
-		.map((model: any) => ({ provider: String(model.provider), id: String(model.id) }));
+	// The catalogue is empty and its accessors can throw before any provider is
+	// authenticated. Never let that escape: it would abort the handler, pi would
+	// swallow the error, and the user would see silence.
+	try {
+		const scoped = Array.isArray(ctx?.scopedModels) ? ctx.scopedModels : [];
+		const source =
+			scoped.length > 0 ? scoped.map((entry: any) => entry?.model) : (ctx?.modelRegistry?.getAvailable?.() ?? []);
+		if (!Array.isArray(source)) return [];
+		return source
+			.filter((model: any) => model?.provider && model?.id)
+			.map((model: any) => ({ provider: String(model.provider), id: String(model.id) }));
+	} catch {
+		return [];
+	}
 }
 
 function numbered(items: string[]): string {
@@ -332,13 +362,20 @@ export default function (pi: any) {
 		const target = resolveTarget();
 		if (!target) return;
 
-		const lower = text.toLowerCase();
-		const [rawCommand = "", ...rest] = text.split(/\s+/);
+		// A burst of messages arrives as one batch; act on the newest command in
+		// it rather than only the final line.
+		const chosen = pending ? text : (pickCommand(String(event.text ?? ""), COMMANDS) ?? text);
+
+		const lower = chosen.toLowerCase();
+		const [rawCommand = "", ...rest] = chosen.split(/\s+/);
 		const command = rawCommand.replace(/^\//, "").toLowerCase();
 		const argument = rest.join(" ").trim();
 
+		if (!pending && !COMMANDS.has(command)) return;
+
 		if (RESERVED.has(command)) return;
 
+		try {
 		// ---- continuation of a pending selection
 		if (pending) {
 			if (lower === "cancel") {
@@ -351,7 +388,7 @@ export default function (pi: any) {
 				const provider = pending.provider;
 				pending = undefined;
 				const auth = readAuth();
-				auth[provider] = { type: "api_key", key: escapeKey(text) };
+				auth[provider] = { type: "api_key", key: escapeKey(chosen) };
 				try {
 					writeAuth(auth);
 				} catch (error: any) {
@@ -373,7 +410,7 @@ export default function (pi: any) {
 				return { action: "handled" };
 			}
 
-			const choice = Number.parseInt(text, 10);
+			const choice = Number.parseInt(chosen, 10);
 			if (!Number.isFinite(choice)) {
 				await send(target, "Reply with a number from the list, or 'cancel'.");
 				return { action: "handled" };
@@ -439,7 +476,7 @@ export default function (pi: any) {
 		}
 
 		// ---- commands
-		switch (command) {
+			switch (command) {
 			case "help":
 				await send(target, HELP);
 				return { action: "handled" };
@@ -560,6 +597,13 @@ export default function (pi: any) {
 
 			default:
 				return;
+			}
+		} catch (error: any) {
+			// pi swallows errors thrown by an input handler, which would leave the
+			// user staring at silence. Surface it in the chat instead.
+			pending = undefined;
+			await send(target, `pi-model-telegram failed: ${error?.message ?? String(error)}`);
+			return { action: "handled" };
 		}
 	});
 }

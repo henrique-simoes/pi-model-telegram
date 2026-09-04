@@ -53,7 +53,7 @@ it never shadows pi's own `/login` and `/model` in the terminal.
 ## Install
 
 ```bash
-pi install git:github.com/henrique-simoes/pi-model-telegram@v0.1.2
+pi install git:github.com/henrique-simoes/pi-model-telegram@v0.1.3
 ```
 
 Any pi package source works:
@@ -82,7 +82,7 @@ pi update --extensions     # update packages and reconcile pinned git refs
 pi update --all            # also update pi itself
 ```
 
-Pinned refs (`@v0.1.2`) are reconciled but not advanced. To move to a new
+Pinned refs (`@v0.1.3`) are reconciled but not advanced. To move to a new
 release, install the new ref explicitly.
 
 ## Security

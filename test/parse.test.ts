@@ -52,3 +52,43 @@ assert.equal(merged.filter((p) => p.key === "anthropic").length, 1);
 assert.ok(merged.some((p) => p.key === "my-local-gateway"));
 
 console.log("provider bootstrap tests passed");
+
+import { pickCommand, transcriptTexts } from "../extensions/pi-model-telegram.ts";
+
+const COMMANDS = new Set([
+  "help", "model", "thinking", "login", "logout", "providers", "whichmodel", "cancel",
+]);
+
+// Reproduces the reported failure: several messages arrive before any job
+// completes, so pi-chat batches them into one prompt. Reading only the last
+// line dropped /login.
+const burst = [
+  "- [t1] [uid:7] H S: /chat",
+  "- [t2] [uid:7] H S: Hey!",
+  "- [t3] [uid:7] H S: /login",
+  "- [t4] [uid:7] H S: /help",
+  "- [t5] [uid:7] H S: Hi",
+].join("\n");
+
+assert.equal(transcriptTexts(burst).length, 5);
+// last line is chatter, but the newest real command must still be found
+assert.equal(pickCommand(burst, COMMANDS), "/help");
+
+// with /help removed, /login is the newest command and must win
+const burst2 = [
+  "- [t1] [uid:7] H S: Hey!",
+  "- [t2] [uid:7] H S: /login",
+  "- [t3] [uid:7] H S: Hi",
+].join("\n");
+assert.equal(pickCommand(burst2, COMMANDS), "/login");
+
+// arguments are preserved
+assert.equal(pickCommand("- [t] [uid:7] H S: /model claude opus", COMMANDS), "/model claude opus");
+
+// no command in the batch
+assert.equal(pickCommand("- [t] [uid:7] H S: just chatting", COMMANDS), undefined);
+
+// bare (slashless) form still recognised
+assert.equal(pickCommand("- [t] [uid:7] H S: help", COMMANDS), "help");
+
+console.log("batch dispatch tests passed");
