@@ -21,7 +21,7 @@
  * no getUpdates conflict.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -69,32 +69,70 @@ export function sanitize(value: string): string {
 }
 
 /**
- * Resolve the Telegram account and channel for this worker. pi-chat does not
- * document the conversationId separator, so match on every plausible joiner and
- * fall back to comparing the tmux-safe form.
+ * Resolve the Telegram account and channel for this worker.
+ *
+ * pi rewrites its process title, so `--chat-conversation` is not visible in
+ * /proc and `process.argv` cannot be relied on alone. Fall back in order:
+ *   1. the `--chat-conversation` flag, when the runtime still exposes it;
+ *   2. the only configured Telegram channel, when there is exactly one;
+ *   3. the channel whose pi-chat log was written most recently, which is the
+ *      one that just delivered the message being handled.
  */
 function resolveTarget(): ChatTarget | undefined {
-	const conversationId = conversationIdFromArgv();
-	if (!conversationId) return undefined;
 	let config: any;
 	try {
 		config = JSON.parse(readFileSync(CHAT_CONFIG, "utf8"));
 	} catch {
 		return undefined;
 	}
+
+	const channels: ChatTarget[] = [];
 	for (const [accountId, account] of Object.entries<any>(config.accounts ?? {})) {
 		if (account?.service !== "telegram" || !account?.botToken) continue;
 		for (const [channelKey, channel] of Object.entries<any>(account.channels ?? {})) {
-			const candidates = [":", "/", "|", "#", "_", "-"].map((sep) => `${accountId}${sep}${channelKey}`);
-			const match =
-				candidates.includes(conversationId) ||
-				candidates.some((candidate) => sanitize(candidate) === sanitize(conversationId));
-			if (match && channel?.id) {
-				return { token: account.botToken, chatId: String(channel.id), accountId, channelKey };
+			if (!channel?.id) continue;
+			channels.push({ token: account.botToken, chatId: String(channel.id), accountId, channelKey });
+		}
+	}
+	if (channels.length === 0) return undefined;
+
+	const conversationId = conversationIdFromArgv();
+	if (conversationId) {
+		for (const candidate of channels) {
+			const joined = [":", "/", "|", "#", "_", "-"].map(
+				(sep) => `${candidate.accountId}${sep}${candidate.channelKey}`,
+			);
+			if (
+				joined.includes(conversationId) ||
+				joined.some((value) => sanitize(value) === sanitize(conversationId))
+			) {
+				return candidate;
 			}
 		}
 	}
-	return undefined;
+
+	if (channels.length === 1) return channels[0];
+
+	let newest: ChatTarget | undefined;
+	let newestAt = -1;
+	for (const candidate of channels) {
+		try {
+			const stamp = statSync(channelLogPath(candidate)).mtimeMs;
+			if (stamp > newestAt) {
+				newestAt = stamp;
+				newest = candidate;
+			}
+		} catch {
+			// channel has no log yet
+		}
+	}
+	return newest;
+}
+
+function channelLogPath(target: ChatTarget): string {
+	return join(
+		AGENT_HOME, "chat", "accounts", target.accountId, "channels", target.channelKey, "channel.jsonl",
+	);
 }
 
 async function send(target: ChatTarget, text: string): Promise<void> {
@@ -115,9 +153,7 @@ async function send(target: ChatTarget, text: string): Promise<void> {
  * record from pi-chat's channel log.
  */
 async function deleteLastInbound(target: ChatTarget): Promise<boolean> {
-	const log = join(
-		AGENT_HOME, "chat", "accounts", target.accountId, "channels", target.channelKey, "channel.jsonl",
-	);
+	const log = channelLogPath(target);
 	let messageId: string | undefined;
 	try {
 		const lines = readFileSync(log, "utf8").trim().split("\n");
@@ -231,15 +267,16 @@ const HELP = [
 // ------------------------------------------------------------------ extension
 
 export default function (pi: any) {
-	const target = resolveTarget();
-	// Outside a pi-chat Telegram worker this extension stays completely inert so
-	// it can never shadow pi's own /login and /model in the TUI.
-	if (!target) return;
-
 	pi.on("input", async (event: any, ctx: any) => {
+		// Only messages pi-chat delivered, and only when the payload really is a
+		// pi-chat transcript line. That pairing is what keeps this extension
+		// inert in the terminal, where pi's own /login and /model must win.
 		if (event?.source !== "extension") return;
 		const text = lastUserText(String(event.text ?? ""));
 		if (!text) return;
+
+		const target = resolveTarget();
+		if (!target) return;
 
 		const lower = text.toLowerCase();
 		const [rawCommand = "", ...rest] = text.split(/\s+/);
