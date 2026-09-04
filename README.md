@@ -36,6 +36,11 @@ That ordering is what makes `/login` possible. With an empty `auth.json` no
 model can run, so no tool call or agent reply could ever happen — a tool-based
 design would be unreachable exactly when you need it most.
 
+A registered tool is not an option either: pi-chat blocks every tool outside
+`read`, `write`, `edit`, `bash`, `chat_history`, `chat_attach`, and
+`chat_request_secret` during a remote turn. Intercepting `input` is the only
+mechanism available to a chat-facing extension.
+
 Because a handled input produces no assistant message, pi-chat has nothing to
 deliver, so this extension sends its replies directly to the Telegram Bot API
 using the token pi-chat already stores. It only *sends*; pi-chat keeps sole
