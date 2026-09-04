@@ -92,3 +92,22 @@ assert.equal(pickCommand("- [t] [uid:7] H S: just chatting", COMMANDS), undefine
 assert.equal(pickCommand("- [t] [uid:7] H S: help", COMMANDS), "help");
 
 console.log("batch dispatch tests passed");
+
+import { chunk } from "../extensions/pi-model-telegram.ts";
+
+// Full provider list must arrive complete, split across messages if needed.
+const long = Array.from({ length: 400 }, (_, i) => `${i + 1}. provider-name-${i} (not authenticated)`).join("\n");
+const parts = chunk(long, 3900);
+assert.ok(parts.length > 1, "a long list must split");
+assert.ok(parts.every((p) => p.length <= 3900), "no part may exceed the Telegram limit");
+// nothing lost: every line survives, in order
+assert.deepEqual(parts.join("\n").split("\n"), long.split("\n"));
+
+// short text is untouched
+assert.deepEqual(chunk("hello"), ["hello"]);
+
+// a single line longer than the limit is still emitted rather than dropped
+const huge = "x".repeat(5000);
+assert.deepEqual(chunk(huge, 3900), [huge]);
+
+console.log("chunking tests passed");

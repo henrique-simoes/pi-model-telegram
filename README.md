@@ -16,6 +16,7 @@ selection stay in pi's terminal UI. This extension brings them to the chat.
 | `/thinking` | List thinking levels and set one |
 | `/login [filter]` | Authenticate a provider with an API key |
 | `/logout <provider>` | Remove a stored provider credential |
+| `/endpoint` | Add a custom OpenAI-compatible endpoint |
 | `/providers` | Show providers and whether each is authenticated |
 | `/whichmodel` | Show the active model and thinking level |
 | `/help` | List these commands |
@@ -53,7 +54,7 @@ it never shadows pi's own `/login` and `/model` in the terminal.
 ## Install
 
 ```bash
-pi install git:github.com/henrique-simoes/pi-model-telegram@v0.1.3
+pi install git:github.com/henrique-simoes/pi-model-telegram@v0.2.0
 ```
 
 Any pi package source works:
@@ -82,7 +83,7 @@ pi update --extensions     # update packages and reconcile pinned git refs
 pi update --all            # also update pi itself
 ```
 
-Pinned refs (`@v0.1.3`) are reconciled but not advanced. To move to a new
+Pinned refs (`@v0.2.0`) are reconciled but not advanced. To move to a new
 release, install the new ref explicitly.
 
 ## Security

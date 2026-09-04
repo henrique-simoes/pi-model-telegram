@@ -1,24 +1,26 @@
 /**
  * pi-model-telegram
  *
- * Brings pi's provider and model management to a Telegram chat that is
- * connected through the pi-chat extension.
+ * Provider and model management for a Telegram chat bridged by pi-chat.
  *
- * How it works
- * ------------
- * pi-chat hands every inbound chat message to pi with `pi.sendUserMessage()`,
- * which raises the `input` event with `source: "extension"`. The documented
- * lifecycle checks that event before the model runs, and a handler may return
- * `{ action: "handled" }` to answer without an LLM turn. That is what makes
- * `/login` usable when no provider is authenticated yet: with an empty
- * auth.json no agent turn can happen at all, so a tool-based approach could
- * never reply.
+ * Two pieces of pi-chat's design shape everything here.
  *
- * Because a handled input never produces assistant output, pi-chat has nothing
- * to deliver. This extension therefore writes its own replies straight to the
- * Telegram Bot API, reusing the bot token pi-chat already stores. It only
- * sends; pi-chat keeps sole ownership of receiving (long polling), so there is
- * no getUpdates conflict.
+ * 1. Inbound chat text arrives through `pi.sendUserMessage()`, which raises
+ *    pi's `input` event before the model runs. That is the only place a
+ *    command can be caught when no provider is authenticated yet, because
+ *    without credentials no agent turn - and therefore no tool call - can
+ *    happen at all.
+ *
+ * 2. `{ action: "handled" }` must NOT be returned. pi-chat sets an internal
+ *    `chatTurnInFlight` flag before dispatching and only clears it from its
+ *    `agent_end` handler. Suppressing the turn leaves that flag stuck true and
+ *    pi-chat silently ignores every later message. So the turn is allowed to
+ *    start and is aborted immediately in `agent_start`; pi-chat sees
+ *    stopReason "aborted", clears the flag, fails the job, and sends nothing.
+ *
+ * Replies are written straight to the Telegram Bot API with the token pi-chat
+ * already stores. Sending only - pi-chat keeps sole ownership of receiving, so
+ * there is no getUpdates conflict.
  */
 
 import { readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
@@ -27,6 +29,7 @@ import { dirname, join } from "node:path";
 
 const AGENT_HOME = join(homedir(), ".pi", "agent");
 const AUTH_FILE = join(AGENT_HOME, "auth.json");
+const MODELS_FILE = join(AGENT_HOME, "models.json");
 const CHAT_CONFIG = join(AGENT_HOME, "chat", "config.json");
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -36,19 +39,12 @@ const RESERVED = new Set(["stop", "new", "compact", "status"]);
 
 /** Commands this extension owns. */
 const COMMANDS = new Set([
-	"help", "model", "thinking", "login", "logout", "providers", "whichmodel", "cancel",
+	"help", "model", "thinking", "login", "logout", "providers", "whichmodel", "endpoint", "cancel",
 ]);
 
-const PAGE = 20;
+/** Telegram rejects messages longer than 4096 characters. */
+const TELEGRAM_LIMIT = 3900;
 
-/**
- * API-key providers, transcribed from pi's own docs/providers.md.
- *
- * The model catalogue is empty until a provider is authenticated, so
- * `ctx.modelRegistry.getAvailable()` cannot bootstrap /login - the exact case
- * /login exists for. This table gives a starting list; anything the catalogue
- * reports at runtime is merged in on top.
- */
 const API_KEY_PROVIDERS: Array<{ key: string; label: string }> = [
 	{ key: "anthropic", label: "Anthropic" },
 	{ key: "openai", label: "OpenAI" },
@@ -94,14 +90,40 @@ export function knownProviders(catalogue: string[]): Array<{ key: string; label:
 	return [...API_KEY_PROVIDERS, ...extra.map((name) => ({ key: name, label: name }))];
 }
 
+/** Split a long reply on line boundaries so nothing is silently truncated. */
+export function chunk(text: string, limit = TELEGRAM_LIMIT): string[] {
+	if (text.length <= limit) return [text];
+	const parts: string[] = [];
+	let current = "";
+	for (const line of text.split("\n")) {
+		const candidate = current ? `${current}\n${line}` : line;
+		if (candidate.length > limit && current) {
+			parts.push(current);
+			current = line;
+		} else {
+			current = candidate;
+		}
+	}
+	if (current) parts.push(current);
+	return parts;
+}
 
 type Pending =
 	| { kind: "model"; items: Array<{ provider: string; id: string }> }
 	| { kind: "thinking" }
 	| { kind: "login"; providers: string[] }
-	| { kind: "apikey"; provider: string };
+	| { kind: "apikey"; provider: string }
+	| { kind: "endpoint"; step: "name" | "baseUrl" | "modelId" | "apiKey"; draft: EndpointDraft };
+
+interface EndpointDraft {
+	name?: string;
+	baseUrl?: string;
+	modelId?: string;
+}
 
 let pending: Pending | undefined;
+/** Set when a command was handled, so the resulting turn is aborted. */
+let suppressTurn = false;
 
 // ---------------------------------------------------------------- chat wiring
 
@@ -112,7 +134,6 @@ interface ChatTarget {
 	channelKey: string;
 }
 
-/** pi-chat spawns each worker with `--chat-conversation <conversationId>`. */
 function conversationIdFromArgv(): string | undefined {
 	const argv = process.argv;
 	for (let i = 0; i < argv.length; i++) {
@@ -127,15 +148,14 @@ export function sanitize(value: string): string {
 	return value.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
 }
 
+function channelLogPath(target: ChatTarget): string {
+	return join(AGENT_HOME, "chat", "accounts", target.accountId, "channels", target.channelKey, "channel.jsonl");
+}
+
 /**
- * Resolve the Telegram account and channel for this worker.
- *
  * pi rewrites its process title, so `--chat-conversation` is not visible in
- * /proc and `process.argv` cannot be relied on alone. Fall back in order:
- *   1. the `--chat-conversation` flag, when the runtime still exposes it;
- *   2. the only configured Telegram channel, when there is exactly one;
- *   3. the channel whose pi-chat log was written most recently, which is the
- *      one that just delivered the message being handled.
+ * /proc and process.argv cannot be trusted alone. Fall back to the only
+ * configured Telegram channel, then to the most recently written channel log.
  */
 function resolveTarget(): ChatTarget | undefined {
 	let config: any;
@@ -144,7 +164,6 @@ function resolveTarget(): ChatTarget | undefined {
 	} catch {
 		return undefined;
 	}
-
 	const channels: ChatTarget[] = [];
 	for (const [accountId, account] of Object.entries<any>(config.accounts ?? {})) {
 		if (account?.service !== "telegram" || !account?.botToken) continue;
@@ -161,15 +180,11 @@ function resolveTarget(): ChatTarget | undefined {
 			const joined = [":", "/", "|", "#", "_", "-"].map(
 				(sep) => `${candidate.accountId}${sep}${candidate.channelKey}`,
 			);
-			if (
-				joined.includes(conversationId) ||
-				joined.some((value) => sanitize(value) === sanitize(conversationId))
-			) {
+			if (joined.includes(conversationId) || joined.some((v) => sanitize(v) === sanitize(conversationId))) {
 				return candidate;
 			}
 		}
 	}
-
 	if (channels.length === 1) return channels[0];
 
 	let newest: ChatTarget | undefined;
@@ -182,40 +197,30 @@ function resolveTarget(): ChatTarget | undefined {
 				newest = candidate;
 			}
 		} catch {
-			// channel has no log yet
+			// no log yet
 		}
 	}
 	return newest;
 }
 
-function channelLogPath(target: ChatTarget): string {
-	return join(
-		AGENT_HOME, "chat", "accounts", target.accountId, "channels", target.channelKey, "channel.jsonl",
-	);
-}
-
 async function send(target: ChatTarget, text: string): Promise<void> {
-	try {
-		await fetch(`https://api.telegram.org/bot${target.token}/sendMessage`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ chat_id: target.chatId, text, disable_web_page_preview: true }),
-		});
-	} catch {
-		// Never let a delivery failure break the worker.
+	for (const part of chunk(text)) {
+		try {
+			await fetch(`https://api.telegram.org/bot${target.token}/sendMessage`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ chat_id: target.chatId, text: part, disable_web_page_preview: true }),
+			});
+		} catch {
+			// never let a delivery failure break the worker
+		}
 	}
 }
 
-/**
- * Best-effort removal of a message from the Telegram chat. Used for the message
- * carrying an API key. The id is not in the prompt, so read the newest inbound
- * record from pi-chat's channel log.
- */
 async function deleteLastInbound(target: ChatTarget): Promise<boolean> {
-	const log = channelLogPath(target);
 	let messageId: string | undefined;
 	try {
-		const lines = readFileSync(log, "utf8").trim().split("\n");
+		const lines = readFileSync(channelLogPath(target), "utf8").trim().split("\n");
 		for (let i = lines.length - 1; i >= 0; i--) {
 			const record = JSON.parse(lines[i] as string);
 			if (record?.type === "inbound" && record?.messageId) {
@@ -233,37 +238,33 @@ async function deleteLastInbound(target: ChatTarget): Promise<boolean> {
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ chat_id: target.chatId, message_id: Number(messageId) }),
 		});
-		const body: any = await response.json();
-		return body?.ok === true;
+		return ((await response.json()) as any)?.ok === true;
 	} catch {
 		return false;
 	}
 }
 
-// ------------------------------------------------------------------ auth file
+// ------------------------------------------------------------- state on disk
 
-function readAuth(): Record<string, any> {
+function readJson(path: string): Record<string, any> {
 	try {
-		const parsed = JSON.parse(readFileSync(AUTH_FILE, "utf8"));
+		const parsed = JSON.parse(readFileSync(path, "utf8"));
 		return parsed && typeof parsed === "object" ? parsed : {};
 	} catch {
 		return {};
 	}
 }
 
-/**
- * `key` supports `!command` and `$VAR` expansion, so a literal secret that
- * begins with either must be escaped or pi would execute or interpolate it.
- */
+function writeJson(path: string, value: Record<string, any>, mode: number): void {
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { mode });
+}
+
+/** `key` supports `!command` and `$VAR`, so a literal secret must be escaped. */
 export function escapeKey(raw: string): string {
 	if (raw.startsWith("$")) return `$$${raw.slice(1)}`;
 	if (raw.startsWith("!")) return `$!${raw.slice(1)}`;
 	return raw;
-}
-
-function writeAuth(auth: Record<string, any>): void {
-	mkdirSync(dirname(AUTH_FILE), { recursive: true });
-	writeFileSync(AUTH_FILE, `${JSON.stringify(auth, null, 2)}\n`, { mode: 0o600 });
 }
 
 // -------------------------------------------------------------- prompt parser
@@ -271,9 +272,7 @@ function writeAuth(auth: Record<string, any>): void {
 /**
  * pi-chat formats each inbound message as
  *   `- [<timestamp>] [uid:<userId>] <userName>: <text>`
- * and batches every message received since the last completed job into ONE
- * prompt. Reading only the final line silently drops a command that arrived
- * with others, so return the whole batch, oldest first.
+ * and batches every message since the last completed job into ONE prompt.
  */
 export function transcriptTexts(prompt: string): string[] {
 	const pattern = /^- \[[^\]]*\] \[uid:[^\]]*\] [^:]*: ([\s\S]*)$/;
@@ -301,29 +300,26 @@ export function pickCommand(prompt: string, commands: Set<string>): string | und
 	return undefined;
 }
 
-// ------------------------------------------------------------------- renderer
+// ------------------------------------------------------------------- helpers
 
 function providerState(ctx: any, provider: string): string {
 	try {
-		const auth = ctx.modelRegistry?.getProviderAuth?.(provider);
+		const auth = ctx?.modelRegistry?.getProviderAuth?.(provider);
 		return auth?.apiKey || auth?.headers || auth?.baseUrl ? "authenticated" : "not authenticated";
 	} catch {
-		return "unknown";
+		return "not authenticated";
 	}
 }
 
 function listModels(ctx: any): Array<{ provider: string; id: string }> {
-	// The catalogue is empty and its accessors can throw before any provider is
-	// authenticated. Never let that escape: it would abort the handler, pi would
-	// swallow the error, and the user would see silence.
 	try {
 		const scoped = Array.isArray(ctx?.scopedModels) ? ctx.scopedModels : [];
 		const source =
-			scoped.length > 0 ? scoped.map((entry: any) => entry?.model) : (ctx?.modelRegistry?.getAvailable?.() ?? []);
+			scoped.length > 0 ? scoped.map((e: any) => e?.model) : (ctx?.modelRegistry?.getAvailable?.() ?? []);
 		if (!Array.isArray(source)) return [];
 		return source
-			.filter((model: any) => model?.provider && model?.id)
-			.map((model: any) => ({ provider: String(model.provider), id: String(model.id) }));
+			.filter((m: any) => m?.provider && m?.id)
+			.map((m: any) => ({ provider: String(m.provider), id: String(m.id) }));
 	} catch {
 		return [];
 	}
@@ -336,13 +332,14 @@ function numbered(items: string[]): string {
 const HELP = [
 	"pi model control",
 	"",
-	"/model [filter]  - list and switch model",
-	"/thinking        - list and set thinking level",
-	"/login           - authenticate a provider with an API key",
-	"/logout <name>   - remove a provider credential",
-	"/providers       - show providers and auth state",
-	"/whichmodel      - show the active model and thinking level",
-	"/help            - this message",
+	"/model [filter]   - list and switch model",
+	"/thinking         - list and set thinking level",
+	"/login [filter]   - authenticate a provider with an API key",
+	"/endpoint         - add a custom OpenAI-compatible endpoint",
+	"/logout <name>    - remove a provider credential",
+	"/providers        - show configured providers and auth state",
+	"/whichmodel       - show the active model and thinking level",
+	"/help             - this message",
 	"",
 	"Reply with a number to pick from a list. Send 'cancel' to abort.",
 	"pi-chat still owns stop, new, compact and status.",
@@ -351,259 +348,325 @@ const HELP = [
 // ------------------------------------------------------------------ extension
 
 export default function (pi: any) {
+	// A handled input would strand pi-chat's chatTurnInFlight flag, so the turn
+	// is allowed to start and cancelled here instead. pi-chat reads stopReason
+	// "aborted", clears the flag, and delivers nothing to the chat.
+	pi.on("agent_start", async (_event: any, ctx: any) => {
+		if (!suppressTurn) return;
+		suppressTurn = false;
+		try {
+			ctx.abort();
+		} catch {
+			// if abort is unavailable the model simply answers as usual
+		}
+	});
+
 	pi.on("input", async (event: any, ctx: any) => {
-		// Only messages pi-chat delivered, and only when the payload really is a
-		// pi-chat transcript line. That pairing is what keeps this extension
-		// inert in the terminal, where pi's own /login and /model must win.
 		if (event?.source !== "extension") return;
-		const text = lastUserText(String(event.text ?? ""));
-		if (!text) return;
+		const raw = String(event.text ?? "");
+		const latest = lastUserText(raw);
+		if (!latest) return;
 
 		const target = resolveTarget();
 		if (!target) return;
 
-		// A burst of messages arrives as one batch; act on the newest command in
-		// it rather than only the final line.
-		const chosen = pending ? text : (pickCommand(String(event.text ?? ""), COMMANDS) ?? text);
-
-		const lower = chosen.toLowerCase();
+		// A burst arrives as one batch; act on the newest recognised command.
+		const chosen = pending ? latest : (pickCommand(raw, COMMANDS) ?? latest);
 		const [rawCommand = "", ...rest] = chosen.split(/\s+/);
 		const command = rawCommand.replace(/^\//, "").toLowerCase();
 		const argument = rest.join(" ").trim();
 
+		if (RESERVED.has(command)) return;
 		if (!pending && !COMMANDS.has(command)) return;
 
-		if (RESERVED.has(command)) return;
+		const reply = async (text: string) => {
+			suppressTurn = true;
+			await send(target, text);
+		};
 
 		try {
-		// ---- continuation of a pending selection
-		if (pending) {
-			if (lower === "cancel") {
-				pending = undefined;
-				await send(target, "Cancelled.");
-				return { action: "handled" };
-			}
-
-			if (pending.kind === "apikey") {
-				const provider = pending.provider;
-				pending = undefined;
-				const auth = readAuth();
-				auth[provider] = { type: "api_key", key: escapeKey(chosen) };
-				try {
-					writeAuth(auth);
-				} catch (error: any) {
-					await send(target, `Could not write auth.json: ${error?.message ?? error}`);
-					return { action: "handled" };
-				}
-				const removed = await deleteLastInbound(target);
-				await send(
-					target,
-					[
-						`Stored an API key for ${provider}.`,
-						removed
-							? "Your message with the key was deleted from this chat."
-							: "Could not delete your message automatically - please delete it yourself.",
-						"The key is also recorded in this channel's local pi-chat log.",
-						"Run /model to pick a model, then send a normal message to test it.",
-					].join("\n"),
-				);
-				return { action: "handled" };
-			}
-
-			const choice = Number.parseInt(chosen, 10);
-			if (!Number.isFinite(choice)) {
-				await send(target, "Reply with a number from the list, or 'cancel'.");
-				return { action: "handled" };
-			}
-
-			if (pending.kind === "model") {
-				const picked = pending.items[choice - 1];
-				pending = undefined;
-				if (!picked) {
-					await send(target, "That number is not on the list.");
-					return { action: "handled" };
-				}
-				const model = ctx.modelRegistry?.find?.(picked.provider, picked.id);
-				if (!model) {
-					await send(target, `Model ${picked.provider}/${picked.id} is no longer available.`);
-					return { action: "handled" };
-				}
-				const ok = await pi.setModel(model);
-				await send(
-					target,
-					ok
-						? `Model set to ${picked.provider}/${picked.id}.`
-						: `No credentials configured for ${picked.provider}. Run /login first.`,
-				);
-				return { action: "handled" };
-			}
-
-			if (pending.kind === "thinking") {
-				const level = THINKING_LEVELS[choice - 1];
-				pending = undefined;
-				if (!level) {
-					await send(target, "That number is not on the list.");
-					return { action: "handled" };
-				}
-				pi.setThinkingLevel(level);
-				await send(target, `Thinking level set to ${level}.`);
-				return { action: "handled" };
-			}
-
-			if (pending.kind === "login") {
-				const provider = pending.providers[choice - 1];
-				if (!provider) {
+			if (pending) {
+				if (command === "cancel") {
 					pending = undefined;
-					await send(target, "That number is not on the list.");
-					return { action: "handled" };
+					await reply("Cancelled.");
+					return;
 				}
-				pending = { kind: "apikey", provider };
-				await send(
-					target,
-					[
-						`Send the API key for ${provider} as your next message.`,
-						"",
-						"Warning: the key will pass through Telegram and be written to this",
-						"channel's local chat log. This extension deletes your message when it",
-						"can, but Telegram may still retain it. For the strongest handling use",
-						"/login in pi's terminal session instead.",
-						"",
-						"Send 'cancel' to abort.",
-					].join("\n"),
-				);
-				return { action: "handled" };
-			}
-		}
 
-		// ---- commands
+				if (pending.kind === "apikey") {
+					const provider = pending.provider;
+					pending = undefined;
+					const auth = readJson(AUTH_FILE);
+					auth[provider] = { type: "api_key", key: escapeKey(chosen) };
+					writeJson(AUTH_FILE, auth, 0o600);
+					const removed = await deleteLastInbound(target);
+					await reply(
+						[
+							`Stored an API key for ${provider}.`,
+							removed
+								? "Your message with the key was deleted from this chat."
+								: "Could not delete your message automatically - please delete it yourself.",
+							"The key is also recorded in this channel's local pi-chat log.",
+							"",
+							"Run /model to pick a model.",
+						].join("\n"),
+					);
+					return;
+				}
+
+				if (pending.kind === "endpoint") {
+					const step = pending.step;
+					const draft = pending.draft;
+					if (step === "name") {
+						const name = sanitize(chosen).toLowerCase();
+						if (!name) {
+							await reply("That name is not usable. Send a short name such as my-openai.");
+							return;
+						}
+						pending = { kind: "endpoint", step: "baseUrl", draft: { ...draft, name } };
+						await reply(
+							`Name: ${name}\n\nSend the base URL, for example https://api.example.com/v1`,
+						);
+						return;
+					}
+					if (step === "baseUrl") {
+						if (!/^https?:\/\//i.test(chosen)) {
+							await reply("That does not look like a URL. Send something starting with https://");
+							return;
+						}
+						pending = { kind: "endpoint", step: "modelId", draft: { ...draft, baseUrl: chosen } };
+						await reply("Send the model id exposed by that endpoint, for example gpt-4o.");
+						return;
+					}
+					if (step === "modelId") {
+						pending = { kind: "endpoint", step: "apiKey", draft: { ...draft, modelId: chosen } };
+						await reply(
+							[
+								"Send the API key for this endpoint.",
+								"",
+								"Warning: the key passes through Telegram and is written to this",
+								"channel's local chat log. Send 'none' if the endpoint ignores keys.",
+							].join("\n"),
+						);
+						return;
+					}
+					// apiKey step
+					const { name, baseUrl, modelId } = draft;
+					pending = undefined;
+					const models = readJson(MODELS_FILE);
+					const providers = (models.providers ??= {});
+					providers[name as string] = {
+						baseUrl,
+						api: "openai-completions",
+						apiKey: chosen.toLowerCase() === "none" ? "unused" : escapeKey(chosen),
+						models: [{ id: modelId }],
+					};
+					writeJson(MODELS_FILE, models, 0o600);
+					await deleteLastInbound(target);
+					await reply(
+						[
+							`Added endpoint "${name}".`,
+							`  base URL: ${baseUrl}`,
+							`  model:    ${modelId}`,
+							"  api:      openai-completions",
+							"",
+							"models.json is read when a worker starts, so this endpoint appears",
+							"after the workers are restarted with /chat-spawn-all --restart in",
+							"pi's terminal session. Then run /model and pick it.",
+						].join("\n"),
+					);
+					return;
+				}
+
+				const choice = Number.parseInt(chosen, 10);
+				if (!Number.isFinite(choice)) {
+					await reply("Reply with a number from the list, or 'cancel'.");
+					return;
+				}
+
+				if (pending.kind === "model") {
+					const picked = pending.items[choice - 1];
+					pending = undefined;
+					if (!picked) {
+						await reply("That number is not on the list.");
+						return;
+					}
+					const model = ctx?.modelRegistry?.find?.(picked.provider, picked.id);
+					if (!model) {
+						await reply(`Model ${picked.provider}/${picked.id} is no longer available.`);
+						return;
+					}
+					const ok = await pi.setModel(model);
+					await reply(
+						ok
+							? `Model set to ${picked.provider}/${picked.id}.`
+							: `No credentials configured for ${picked.provider}. Run /login first.`,
+					);
+					return;
+				}
+
+				if (pending.kind === "thinking") {
+					const level = THINKING_LEVELS[choice - 1];
+					pending = undefined;
+					if (!level) {
+						await reply("That number is not on the list.");
+						return;
+					}
+					pi.setThinkingLevel(level);
+					await reply(`Thinking level set to ${level}.`);
+					return;
+				}
+
+				if (pending.kind === "login") {
+					const provider = pending.providers[choice - 1];
+					if (!provider) {
+						pending = undefined;
+						await reply("That number is not on the list.");
+						return;
+					}
+					pending = { kind: "apikey", provider };
+					await reply(
+						[
+							`Send the API key for ${provider} as your next message.`,
+							"",
+							"Warning: the key passes through Telegram and is written to this",
+							"channel's local chat log. This extension deletes your message when it",
+							"can. For the strongest handling use /login in pi's terminal session.",
+							"",
+							"Send 'cancel' to abort.",
+						].join("\n"),
+					);
+					return;
+				}
+			}
+
 			switch (command) {
-			case "help":
-				await send(target, HELP);
-				return { action: "handled" };
+				case "help":
+					await reply(HELP);
+					return;
 
-			case "whichmodel": {
-				const model = ctx.model;
-				await send(
-					target,
-					model
-						? `Model: ${model.provider}/${model.id}\nThinking: ${ctx.thinkingLevel ?? "unknown"}`
-						: "No model is currently active. Run /login, then /model.",
-				);
-				return { action: "handled" };
-			}
-
-			case "providers": {
-				const catalogue = [...new Set(listModels(ctx).map((entry) => entry.provider))];
-				const stored = Object.keys(readAuth());
-				const rows = knownProviders(catalogue)
-					.filter((entry) => stored.includes(entry.key) || catalogue.includes(entry.key))
-					.map((entry) => `- ${entry.label} (${entry.key}): ${providerState(ctx, entry.key)}`);
-				await send(
-					target,
-					rows.length
-						? `Configured providers:\n${rows.join("\n")}`
-						: "No provider is configured yet. Run /login to add one.",
-				);
-				return { action: "handled" };
-			}
-
-			case "model": {
-				let models = listModels(ctx);
-				if (argument) {
-					const needle = argument.toLowerCase();
-					models = models.filter((entry) => `${entry.provider}/${entry.id}`.toLowerCase().includes(needle));
-				}
-				if (models.length === 0) {
-					await send(
-						target,
-						argument
-							? `No model matches "${argument}".`
-							: "No models are available yet. Authenticate a provider with /login first.",
+				case "whichmodel": {
+					const model = ctx?.model;
+					await reply(
+						model
+							? `Model: ${model.provider}/${model.id}\nThinking: ${ctx?.thinkingLevel ?? "unknown"}`
+							: "No model is active. Run /login, then /model.",
 					);
-					return { action: "handled" };
+					return;
 				}
-				const shown = models.slice(0, PAGE);
-				pending = { kind: "model", items: shown };
-				const active = ctx.model ? `\n\nActive: ${ctx.model.provider}/${ctx.model.id}` : "";
-				const more =
-					models.length > shown.length
-						? `\n\n${models.length - shown.length} more. Narrow with /model <filter>.`
-						: "";
-				await send(
-					target,
-					`Select a model:\n${numbered(shown.map((entry) => `${entry.provider}/${entry.id}`))}${more}${active}`,
-				);
-				return { action: "handled" };
-			}
 
-			case "thinking": {
-				pending = { kind: "thinking" };
-				await send(
-					target,
-					`Select a thinking level:\n${numbered([...THINKING_LEVELS])}\n\nActive: ${ctx.thinkingLevel ?? "unknown"}`,
-				);
-				return { action: "handled" };
-			}
-
-			case "login": {
-				const catalogue = [...new Set(listModels(ctx).map((entry) => entry.provider))];
-				let providers = knownProviders(catalogue);
-				if (argument) {
-					const needle = argument.toLowerCase();
-					providers = providers.filter(
-						(entry) =>
-							entry.key.toLowerCase().includes(needle) || entry.label.toLowerCase().includes(needle),
+				case "providers": {
+					const catalogue = [...new Set(listModels(ctx).map((e) => e.provider))];
+					const stored = Object.keys(readJson(AUTH_FILE));
+					const custom = Object.keys(readJson(MODELS_FILE).providers ?? {});
+					const rows = knownProviders([...catalogue, ...custom])
+						.filter((e) => stored.includes(e.key) || catalogue.includes(e.key) || custom.includes(e.key))
+						.map((e) => `- ${e.label} (${e.key}): ${providerState(ctx, e.key)}`);
+					await reply(
+						rows.length
+							? `Configured providers:\n${rows.join("\n")}`
+							: "No provider is configured yet. Run /login to add one.",
 					);
+					return;
 				}
-				if (providers.length === 0) {
-					await send(target, `No provider matches "${argument}".`);
-					return { action: "handled" };
-				}
-				const shown = providers.slice(0, PAGE);
-				pending = { kind: "login", providers: shown.map((entry) => entry.key) };
-				const more =
-					providers.length > shown.length
-						? `\n\n${providers.length - shown.length} more. Narrow with /login <filter>.`
-						: "";
-				await send(
-					target,
-					[
-						"Select a provider to authenticate with an API key:",
-						numbered(shown.map((entry) => `${entry.label} (${providerState(ctx, entry.key)})`)),
-						more,
-						"",
-						"Subscription and OAuth sign-in are not available over chat;",
-						"use /login in pi's terminal session for those.",
-					].join("\n"),
-				);
-				return { action: "handled" };
-			}
 
-			case "logout": {
-				if (!argument) {
-					await send(target, "Usage: /logout <provider>");
-					return { action: "handled" };
+				case "model": {
+					let models = listModels(ctx);
+					if (argument) {
+						const needle = argument.toLowerCase();
+						models = models.filter((e) => `${e.provider}/${e.id}`.toLowerCase().includes(needle));
+					}
+					if (models.length === 0) {
+						await reply(
+							argument
+								? `No model matches "${argument}".`
+								: "No models are available yet. Authenticate a provider with /login first.",
+						);
+						return;
+					}
+					pending = { kind: "model", items: models };
+					const active = ctx?.model ? `\n\nActive: ${ctx.model.provider}/${ctx.model.id}` : "";
+					await reply(
+						`Select a model:\n${numbered(models.map((e) => `${e.provider}/${e.id}`))}${active}`,
+					);
+					return;
 				}
-				const auth = readAuth();
-				if (!(argument in auth)) {
-					await send(target, `No stored credential for ${argument}.`);
-					return { action: "handled" };
-				}
-				delete auth[argument];
-				writeAuth(auth);
-				await send(target, `Removed the stored credential for ${argument}.`);
-				return { action: "handled" };
-			}
 
-			default:
-				return;
+				case "thinking": {
+					pending = { kind: "thinking" };
+					await reply(
+						`Select a thinking level:\n${numbered([...THINKING_LEVELS])}\n\nActive: ${ctx?.thinkingLevel ?? "unknown"}`,
+					);
+					return;
+				}
+
+				case "login": {
+					const catalogue = [...new Set(listModels(ctx).map((e) => e.provider))];
+					const custom = Object.keys(readJson(MODELS_FILE).providers ?? {});
+					let providers = knownProviders([...catalogue, ...custom]);
+					if (argument) {
+						const needle = argument.toLowerCase();
+						providers = providers.filter(
+							(e) => e.key.toLowerCase().includes(needle) || e.label.toLowerCase().includes(needle),
+						);
+					}
+					if (providers.length === 0) {
+						await reply(`No provider matches "${argument}".`);
+						return;
+					}
+					pending = { kind: "login", providers: providers.map((e) => e.key) };
+					await reply(
+						[
+							"Select a provider to authenticate with an API key:",
+							numbered(providers.map((e) => `${e.label} (${providerState(ctx, e.key)})`)),
+							"",
+							"/endpoint adds a custom OpenAI-compatible URL.",
+							"Subscription and OAuth sign-in need pi's terminal session.",
+						].join("\n"),
+					);
+					return;
+				}
+
+				case "endpoint": {
+					pending = { kind: "endpoint", step: "name", draft: {} };
+					await reply(
+						[
+							"Add a custom OpenAI-compatible endpoint.",
+							"",
+							"Send a short name for it, for example my-openai or vllm.",
+							"Send 'cancel' to abort.",
+						].join("\n"),
+					);
+					return;
+				}
+
+				case "logout": {
+					if (!argument) {
+						await reply("Usage: /logout <provider>");
+						return;
+					}
+					const auth = readJson(AUTH_FILE);
+					if (!(argument in auth)) {
+						await reply(`No stored credential for ${argument}.`);
+						return;
+					}
+					delete auth[argument];
+					writeJson(AUTH_FILE, auth, 0o600);
+					await reply(`Removed the stored credential for ${argument}.`);
+					return;
+				}
+
+				case "cancel":
+					await reply("Nothing to cancel.");
+					return;
+
+				default:
+					return;
 			}
 		} catch (error: any) {
 			// pi swallows errors thrown by an input handler, which would leave the
 			// user staring at silence. Surface it in the chat instead.
 			pending = undefined;
-			await send(target, `pi-model-telegram failed: ${error?.message ?? String(error)}`);
-			return { action: "handled" };
+			await reply(`pi-model-telegram failed: ${error?.message ?? String(error)}`);
 		}
 	});
 }
