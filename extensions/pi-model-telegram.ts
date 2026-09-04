@@ -397,11 +397,18 @@ export default function (pi: any) {
 			// ctx.newSession(), whose session_shutdown tears the runtime down and
 			// clears the flag, then reconnects the same conversation. pi-chat
 			// uses it for its own "new" control command.
-			try {
-				pi.sendUserMessage("/chat-new", { deliverAs: "followUp" });
-			} catch {
-				// leave the flag alone rather than crash the handler
-			}
+			//
+			// Deliver it plainly: `deliverAs: "followUp"` queues the message until
+			// the agent finishes, and here no agent ever finishes, so the reset was
+			// never delivered at all. Defer by a tick so the current input handler
+			// returns before the session is replaced.
+			setTimeout(() => {
+				try {
+					pi.sendUserMessage("/chat-new");
+				} catch {
+					// leave the flag alone rather than crash the worker
+				}
+			}, 500);
 		};
 
 		try {

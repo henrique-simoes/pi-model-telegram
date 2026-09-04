@@ -54,7 +54,7 @@ it never shadows pi's own `/login` and `/model` in the terminal.
 ## Install
 
 ```bash
-pi install git:github.com/henrique-simoes/pi-model-telegram@v0.2.1
+pi install git:github.com/henrique-simoes/pi-model-telegram@v0.2.2
 ```
 
 Any pi package source works:
@@ -83,8 +83,23 @@ pi update --extensions     # update packages and reconcile pinned git refs
 pi update --all            # also update pi itself
 ```
 
-Pinned refs (`@v0.2.1`) are reconciled but not advanced. To move to a new
+Pinned refs (`@v0.2.2`) are reconciled but not advanced. To move to a new
 release, install the new ref explicitly.
+
+## Before a provider is authenticated
+
+pi-chat cannot complete a turn without a model: it sets an internal
+`chatTurnInFlight` flag when it dispatches and clears it only from `agent_end`,
+which never fires when no model exists. Left alone, the channel accepts exactly
+one message and then ignores everything after it - this happens with or without
+this extension.
+
+While no provider is authenticated, each handled command therefore triggers a
+`/chat-new` session reset so pi-chat can dispatch again. That reset reconnects
+the same conversation but takes a few seconds, so **allow roughly half a minute
+between commands until you have authenticated a provider and picked a model.**
+Once a model is active, turns run normally, the reset stops, and commands are
+immediate.
 
 ## Security
 
