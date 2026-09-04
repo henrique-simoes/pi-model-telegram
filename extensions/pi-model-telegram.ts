@@ -36,6 +36,60 @@ const RESERVED = new Set(["stop", "new", "compact", "status"]);
 
 const PAGE = 20;
 
+/**
+ * API-key providers, transcribed from pi's own docs/providers.md.
+ *
+ * The model catalogue is empty until a provider is authenticated, so
+ * `ctx.modelRegistry.getAvailable()` cannot bootstrap /login - the exact case
+ * /login exists for. This table gives a starting list; anything the catalogue
+ * reports at runtime is merged in on top.
+ */
+const API_KEY_PROVIDERS: Array<{ key: string; label: string }> = [
+	{ key: "anthropic", label: "Anthropic" },
+	{ key: "openai", label: "OpenAI" },
+	{ key: "google", label: "Google Gemini" },
+	{ key: "xai", label: "xAI" },
+	{ key: "openrouter", label: "OpenRouter" },
+	{ key: "deepseek", label: "DeepSeek" },
+	{ key: "mistral", label: "Mistral" },
+	{ key: "groq", label: "Groq" },
+	{ key: "cerebras", label: "Cerebras" },
+	{ key: "fireworks", label: "Fireworks" },
+	{ key: "together", label: "Together AI" },
+	{ key: "baseten", label: "Baseten" },
+	{ key: "nvidia", label: "NVIDIA NIM" },
+	{ key: "huggingface", label: "Hugging Face" },
+	{ key: "vercel-ai-gateway", label: "Vercel AI Gateway" },
+	{ key: "amazon-bedrock", label: "Amazon Bedrock" },
+	{ key: "azure-openai-responses", label: "Azure OpenAI Responses" },
+	{ key: "cloudflare-ai-gateway", label: "Cloudflare AI Gateway" },
+	{ key: "cloudflare-workers-ai", label: "Cloudflare Workers AI" },
+	{ key: "ant-ling", label: "Ant Ling" },
+	{ key: "zai", label: "ZAI Coding Plan (Global)" },
+	{ key: "zai-coding-cn", label: "ZAI Coding Plan (China)" },
+	{ key: "opencode", label: "OpenCode Zen" },
+	{ key: "opencode-go", label: "OpenCode Go" },
+	{ key: "radius", label: "Radius" },
+	{ key: "kimi-coding", label: "Kimi For Coding" },
+	{ key: "minimax", label: "MiniMax" },
+	{ key: "minimax-cn", label: "MiniMax (China)" },
+	{ key: "qwen-token-plan", label: "Qwen Token Plan" },
+	{ key: "qwen-token-plan-individual", label: "Qwen Token Plan (Individual)" },
+	{ key: "qwen-token-plan-cn", label: "Qwen Token Plan (China)" },
+	{ key: "xiaomi", label: "Xiaomi MiMo" },
+	{ key: "xiaomi-token-plan-cn", label: "Xiaomi MiMo Token Plan (China)" },
+	{ key: "xiaomi-token-plan-ams", label: "Xiaomi MiMo Token Plan (Amsterdam)" },
+	{ key: "xiaomi-token-plan-sgp", label: "Xiaomi MiMo Token Plan (Singapore)" },
+];
+
+/** Documented providers first, then anything extra the catalogue knows about. */
+export function knownProviders(catalogue: string[]): Array<{ key: string; label: string }> {
+	const seen = new Set(API_KEY_PROVIDERS.map((entry) => entry.key));
+	const extra = [...new Set(catalogue)].filter((name) => !seen.has(name)).sort();
+	return [...API_KEY_PROVIDERS, ...extra.map((name) => ({ key: name, label: name }))];
+}
+
+
 type Pending =
 	| { kind: "model"; items: Array<{ provider: string; id: string }> }
 	| { kind: "thinking" }
@@ -402,12 +456,16 @@ export default function (pi: any) {
 			}
 
 			case "providers": {
-				const names = [...new Set(listModels(ctx).map((entry) => entry.provider))].sort();
+				const catalogue = [...new Set(listModels(ctx).map((entry) => entry.provider))];
+				const stored = Object.keys(readAuth());
+				const rows = knownProviders(catalogue)
+					.filter((entry) => stored.includes(entry.key) || catalogue.includes(entry.key))
+					.map((entry) => `- ${entry.label} (${entry.key}): ${providerState(ctx, entry.key)}`);
 				await send(
 					target,
-					names.length
-						? `Providers:\n${names.map((name) => `- ${name}: ${providerState(ctx, name)}`).join("\n")}`
-						: "No providers are available in the catalogue.",
+					rows.length
+						? `Configured providers:\n${rows.join("\n")}`
+						: "No provider is configured yet. Run /login to add one.",
 				);
 				return { action: "handled" };
 			}
@@ -419,7 +477,12 @@ export default function (pi: any) {
 					models = models.filter((entry) => `${entry.provider}/${entry.id}`.toLowerCase().includes(needle));
 				}
 				if (models.length === 0) {
-					await send(target, argument ? `No model matches "${argument}".` : "No models are available.");
+					await send(
+						target,
+						argument
+							? `No model matches "${argument}".`
+							: "No models are available yet. Authenticate a provider with /login first.",
+					);
 					return { action: "handled" };
 				}
 				const shown = models.slice(0, PAGE);
@@ -446,21 +509,31 @@ export default function (pi: any) {
 			}
 
 			case "login": {
-				let providers = [...new Set(listModels(ctx).map((entry) => entry.provider))].sort();
+				const catalogue = [...new Set(listModels(ctx).map((entry) => entry.provider))];
+				let providers = knownProviders(catalogue);
 				if (argument) {
 					const needle = argument.toLowerCase();
-					providers = providers.filter((name) => name.toLowerCase().includes(needle));
+					providers = providers.filter(
+						(entry) =>
+							entry.key.toLowerCase().includes(needle) || entry.label.toLowerCase().includes(needle),
+					);
 				}
 				if (providers.length === 0) {
-					await send(target, "No providers are available in the catalogue.");
+					await send(target, `No provider matches "${argument}".`);
 					return { action: "handled" };
 				}
-				pending = { kind: "login", providers };
+				const shown = providers.slice(0, PAGE);
+				pending = { kind: "login", providers: shown.map((entry) => entry.key) };
+				const more =
+					providers.length > shown.length
+						? `\n\n${providers.length - shown.length} more. Narrow with /login <filter>.`
+						: "";
 				await send(
 					target,
 					[
 						"Select a provider to authenticate with an API key:",
-						numbered(providers.map((name) => `${name} (${providerState(ctx, name)})`)),
+						numbered(shown.map((entry) => `${entry.label} (${providerState(ctx, entry.key)})`)),
+						more,
 						"",
 						"Subscription and OAuth sign-in are not available over chat;",
 						"use /login in pi's terminal session for those.",

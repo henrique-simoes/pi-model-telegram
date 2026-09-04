@@ -37,3 +37,18 @@ assert.equal(escapeKey("sk-ant-abc"), "sk-ant-abc");
 assert.equal(sanitize("telegram-bearino:dm-awahe"), "telegram-bearino_dm-awahe");
 
 console.log("all parser tests passed");
+
+import { knownProviders } from "../extensions/pi-model-telegram.ts";
+
+// Bootstrap: works with an empty catalogue, which is the /login case.
+const bootstrap = knownProviders([]);
+assert.ok(bootstrap.length >= 30, "documented providers must be listed without a catalogue");
+assert.ok(bootstrap.some((p) => p.key === "anthropic" && p.label === "Anthropic"));
+assert.ok(bootstrap.some((p) => p.key === "google" && p.label === "Google Gemini"));
+
+// Catalogue-only providers are appended, never duplicated.
+const merged = knownProviders(["anthropic", "my-local-gateway"]);
+assert.equal(merged.filter((p) => p.key === "anthropic").length, 1);
+assert.ok(merged.some((p) => p.key === "my-local-gateway"));
+
+console.log("provider bootstrap tests passed");
